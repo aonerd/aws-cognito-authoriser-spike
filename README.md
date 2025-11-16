@@ -135,8 +135,11 @@ chmod +x test_access_token.sh
 ### 4. Test Logout & Token Invalidation Security
 
 ```bash
-# Test logout functionality and token invalidation (JWT authorizer behavior)
+# Test JWT authorizer (default - demonstrates stateless limitation)
 ./test_logout_security.sh
+
+# Test Lambda authorizer (revocation-aware - tokens rejected after logout)
+STACK_NAME=cognito-api-spike-lambda ./test_logout_security.sh
 ```
 
 ## 📁 Project Structure

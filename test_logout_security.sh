@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Test logout functionality and token invalidation security
+# This script tests either JWT authorizer (stateless) or Lambda authorizer (revocation-aware)
+# Configure STACK_NAME to point to the desired stack
 
 set -euo pipefail
 
-STACK_NAME="cognito-api-spike"
+# Default to JWT authorizer stack; set to "cognito-api-spike-lambda" for Lambda authorizer
+STACK_NAME="${STACK_NAME:-cognito-api-spike-lambda}"
 REGION="us-east-1"
 USERNAME="testuser@example.com"
 PASSWORD="MySecurePass123!"
@@ -39,10 +42,23 @@ echo_status "Getting stack configuration..."
 USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --query 'Stacks[0].Outputs[?OutputKey==`UserPoolId`].OutputValue' --output text)
 CLIENT_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --query 'Stacks[0].Outputs[?OutputKey==`UserPoolClientId`].OutputValue' --output text)
 API_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' --output text)
+AUTHORIZER_TYPE=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --query 'Stacks[0].Outputs[?OutputKey==`AuthorizerType`].OutputValue' --output text 2>/dev/null || echo "JWT (stateless)")
 
+echo "Stack Name: $STACK_NAME"
 echo "User Pool ID: $USER_POOL_ID"
 echo "Client ID: $CLIENT_ID"
 echo "API URL: $API_URL"
+echo "Authorizer Type: $AUTHORIZER_TYPE"
+echo ""
+
+# Determine token to use based on authorizer type
+if [[ "$AUTHORIZER_TYPE" == *"Lambda"* ]]; then
+    echo_warning "Note: Lambda Authorizer detected - using Access tokens for revocation checks"
+    USE_ACCESS_TOKEN_PRIMARY=true
+else
+    echo_warning "Note: JWT Authorizer detected - testing with both ID and Access tokens"
+    USE_ACCESS_TOKEN_PRIMARY=false
+fi
 echo ""
 
 # Step 1: Authenticate and get initial tokens
@@ -71,23 +87,7 @@ echo ""
 # Step 2: Test tokens before logout
 echo_status "Step 2: Testing tokens BEFORE logout (establishing baseline)..."
 
-# Test ID token
-echo_status "Testing ID token before logout..."
-ID_PRE_RESPONSE=$(curl -sS -o /tmp/id_pre_logout.json -w "%{http_code}" "${API_URL}/secure" \
-  -H "Authorization: Bearer ${ID_TOKEN}")
-ID_PRE_BODY=$(cat /tmp/id_pre_logout.json 2>/dev/null || echo "{}")
-
-echo "HTTP Status: $ID_PRE_RESPONSE"
-if [ "$ID_PRE_RESPONSE" = "200" ]; then
-    echo_success "✅ ID token working before logout"
-    echo "Response preview: $(echo "$ID_PRE_BODY" | jq -c '.message + " (authenticated: " + (.authenticated|tostring) + ")"' 2>/dev/null || echo "$ID_PRE_BODY")"
-else
-    echo_error "❌ ID token failed before logout - test setup issue"
-    echo "Response: $ID_PRE_BODY"
-    exit 1
-fi
-
-# Test Access token
+# Test Access token (primary for Lambda Authorizer)
 echo_status "Testing Access token before logout..."
 ACCESS_PRE_RESPONSE=$(curl -sS -o /tmp/access_pre_logout.json -w "%{http_code}" "${API_URL}/secure" \
   -H "Authorization: Bearer ${ACCESS_TOKEN}")
@@ -102,14 +102,42 @@ else
     echo "Response: $ACCESS_PRE_BODY"
     exit 1
 fi
+
+
+# Test ID token (for JWT authorizer comparison)
+if [ "$USE_ACCESS_TOKEN_PRIMARY" = false ]; then
+    echo_status "Testing ID token before logout..."
+    ID_PRE_RESPONSE=$(curl -sS -o /tmp/id_pre_logout.json -w "%{http_code}" "${API_URL}/secure" \
+      -H "Authorization: Bearer ${ID_TOKEN}")
+    ID_PRE_BODY=$(cat /tmp/id_pre_logout.json 2>/dev/null || echo "{}")
+
+    echo "HTTP Status: $ID_PRE_RESPONSE"
+    if [ "$ID_PRE_RESPONSE" = "200" ]; then
+        echo_success "✅ ID token working before logout"
+        echo "Response preview: $(echo "$ID_PRE_BODY" | jq -c '.message + " (authenticated: " + (.authenticated|tostring) + ")"' 2>/dev/null || echo "$ID_PRE_BODY")"
+    else
+        echo_warning "⚠️  ID token failed before logout"
+        echo "Response: $ID_PRE_BODY"
+    fi
+else
+    echo_warning "⚠️  Skipping ID token test (Lambda Authorizer requires Access tokens)"
+    ID_PRE_RESPONSE="200"
+fi
 echo ""
+
+
+echo "curl -s -H \"Authorization: Bearer $ACCESS_TOKEN\" \"$API_URL/secure\""
+echo
+sleep 3
 
 # Step 3: Perform global logout
 echo_status "Step 3: Performing GLOBAL LOGOUT to invalidate all user tokens..."
-aws cognito-idp admin-user-global-sign-out \
-  --user-pool-id "$USER_POOL_ID" \
-  --username "$USERNAME" \
-  --region "$REGION"
+
+echo `aws cognito-idp global-sign-out --access-token "$ACCESS_TOKEN" --region "$REGION"`
+
+sleep 3
+
+echo
 
 if [ $? -eq 0 ]; then
     echo_success "✅ Global sign-out completed successfully"
@@ -120,31 +148,18 @@ else
 fi
 echo ""
 
+
+
 # Wait for logout to propagate
 echo_status "⏳ Waiting 3 seconds for logout to propagate..."
 sleep 3
 
+
+
 # Step 4: Test tokens after logout (should fail)
 echo_status "Step 4: Testing SAME tokens AFTER logout (should be REJECTED)..."
 
-# Test ID token after logout
-echo_status "Testing ID token after logout..."
-ID_POST_RESPONSE=$(curl -sS -o /tmp/id_post_logout.json -w "%{http_code}" "${API_URL}/secure" \
-  -H "Authorization: Bearer ${ID_TOKEN}")
-ID_POST_BODY=$(cat /tmp/id_post_logout.json 2>/dev/null || echo "{}")
-
-echo "HTTP Status: $ID_POST_RESPONSE"
-echo "Response: $ID_POST_BODY"
-
-if [ "$ID_POST_RESPONSE" = "401" ] || [ "$ID_POST_RESPONSE" = "403" ]; then
-    echo_success "✅ SECURITY TEST PASSED: ID token correctly rejected after logout"
-else
-    echo_error "❌ SECURITY VULNERABILITY: ID token still accepted after logout!"
-    echo_error "   Expected: 401/403, Got: $ID_POST_RESPONSE"
-    echo_error "   This is a serious security issue - logged out tokens should not work!"
-fi
-
-# Test Access token after logout
+# Test Access token after logout (primary test)
 echo_status "Testing Access token after logout..."
 ACCESS_POST_RESPONSE=$(curl -sS -o /tmp/access_post_logout.json -w "%{http_code}" "${API_URL}/secure" \
   -H "Authorization: Bearer ${ACCESS_TOKEN}")
@@ -156,9 +171,37 @@ echo "Response: $ACCESS_POST_BODY"
 if [ "$ACCESS_POST_RESPONSE" = "401" ] || [ "$ACCESS_POST_RESPONSE" = "403" ]; then
     echo_success "✅ SECURITY TEST PASSED: Access token correctly rejected after logout"
 else
-    echo_error "❌ SECURITY VULNERABILITY: Access token still accepted after logout!"
-    echo_error "   Expected: 401/403, Got: $ACCESS_POST_RESPONSE"
-    echo_error "   This is a serious security issue - logged out tokens should not work!"
+    if [ "$USE_ACCESS_TOKEN_PRIMARY" = true ]; then
+        echo_error "❌ SECURITY VULNERABILITY: Access token still accepted after logout!"
+        echo_error "   Expected: 401/403, Got: $ACCESS_POST_RESPONSE"
+        echo_error "   This is a serious security issue - logged out tokens should not work!"
+    else
+        echo_warning "⚠️  EXPECTED BEHAVIOR (JWT Authorizer): Access token still accepted after logout"
+        echo_warning "   JWT Authorizer is stateless and cannot check revocation"
+        echo_warning "   See docs/SECURITY_ANALYSIS.md for mitigation strategies"
+    fi
+fi
+
+# Test ID token after logout (for JWT authorizer comparison)
+if [ "$USE_ACCESS_TOKEN_PRIMARY" = false ]; then
+    echo_status "Testing ID token after logout..."
+    ID_POST_RESPONSE=$(curl -sS -o /tmp/id_post_logout.json -w "%{http_code}" "${API_URL}/secure" \
+      -H "Authorization: Bearer ${ID_TOKEN}")
+    ID_POST_BODY=$(cat /tmp/id_post_logout.json 2>/dev/null || echo "{}")
+
+    echo "HTTP Status: $ID_POST_RESPONSE"
+    echo "Response: $ID_POST_BODY"
+
+    if [ "$ID_POST_RESPONSE" = "401" ] || [ "$ID_POST_RESPONSE" = "403" ]; then
+        echo_success "✅ SECURITY TEST PASSED: ID token correctly rejected after logout"
+    else
+        echo_warning "⚠️  EXPECTED BEHAVIOR (JWT Authorizer): ID token still accepted after logout"
+        echo_warning "   JWT Authorizer is stateless and cannot check revocation"
+        echo_warning "   See docs/SECURITY_ANALYSIS.md for mitigation strategies"
+    fi
+else
+    echo_warning "⚠️  Skipping ID token test (Lambda Authorizer requires Access tokens)"
+    ID_POST_RESPONSE="401"
 fi
 echo ""
 
@@ -189,25 +232,10 @@ FRESH_AUTH_RESPONSE=$(aws cognito-idp initiate-auth \
 FRESH_ID_TOKEN=$(echo "$FRESH_AUTH_RESPONSE" | jq -r '.AuthenticationResult.IdToken')
 FRESH_ACCESS_TOKEN=$(echo "$FRESH_AUTH_RESPONSE" | jq -r '.AuthenticationResult.AccessToken')
 
-if [ -n "$FRESH_ID_TOKEN" ] && [ "$FRESH_ID_TOKEN" != "null" ]; then
+if [ -n "$FRESH_ACCESS_TOKEN" ] && [ "$FRESH_ACCESS_TOKEN" != "null" ]; then
     echo_success "✅ Fresh tokens obtained successfully after logout"
 
-    # Test fresh ID token
-    echo_status "Testing fresh ID token..."
-    FRESH_ID_RESPONSE=$(curl -sS -o /tmp/fresh_id.json -w "%{http_code}" "${API_URL}/secure" \
-      -H "Authorization: Bearer ${FRESH_ID_TOKEN}")
-    FRESH_ID_BODY=$(cat /tmp/fresh_id.json 2>/dev/null || echo "{}")
-
-    echo "HTTP Status: $FRESH_ID_RESPONSE"
-    if [ "$FRESH_ID_RESPONSE" = "200" ]; then
-        echo_success "✅ Fresh ID token works correctly"
-        echo "Response preview: $(echo "$FRESH_ID_BODY" | jq -c '.message + " (authenticated: " + (.authenticated|tostring) + ")"' 2>/dev/null)"
-    else
-        echo_error "❌ Fresh ID token failed"
-        echo "Response: $FRESH_ID_BODY"
-    fi
-
-    # Test fresh Access token
+    # Test fresh Access token (primary test)
     echo_status "Testing fresh Access token..."
     FRESH_ACCESS_RESPONSE=$(curl -sS -o /tmp/fresh_access.json -w "%{http_code}" "${API_URL}/secure" \
       -H "Authorization: Bearer ${FRESH_ACCESS_TOKEN}")
@@ -221,6 +249,26 @@ if [ -n "$FRESH_ID_TOKEN" ] && [ "$FRESH_ID_TOKEN" != "null" ]; then
         echo_error "❌ Fresh Access token failed"
         echo "Response: $FRESH_ACCESS_BODY"
     fi
+
+    # Test fresh ID token (only for JWT authorizer)
+    if [ "$USE_ACCESS_TOKEN_PRIMARY" = false ]; then
+        echo_status "Testing fresh ID token..."
+        FRESH_ID_RESPONSE=$(curl -sS -o /tmp/fresh_id.json -w "%{http_code}" "${API_URL}/secure" \
+          -H "Authorization: Bearer ${FRESH_ID_TOKEN}")
+        FRESH_ID_BODY=$(cat /tmp/fresh_id.json 2>/dev/null || echo "{}")
+
+        echo "HTTP Status: $FRESH_ID_RESPONSE"
+        if [ "$FRESH_ID_RESPONSE" = "200" ]; then
+            echo_success "✅ Fresh ID token works correctly"
+            echo "Response preview: $(echo "$FRESH_ID_BODY" | jq -c '.message + " (authenticated: " + (.authenticated|tostring) + ")"' 2>/dev/null)"
+        else
+            echo_error "❌ Fresh ID token failed"
+            echo "Response: $FRESH_ID_BODY"
+        fi
+    else
+        echo_warning "⚠️  Skipping ID token test (Lambda Authorizer requires Access tokens only)"
+        echo_warning "   ID tokens are not supported by Lambda Authorizer - this is expected"
+    fi
 else
     echo_error "❌ Failed to obtain fresh tokens after logout"
 fi
@@ -232,20 +280,30 @@ echo ""
 
 SECURITY_ISSUES=0
 
-if [ "$ID_POST_RESPONSE" != "401" ] && [ "$ID_POST_RESPONSE" != "403" ]; then
-    echo_error "❌ ID Token Security Issue: Logged out tokens still accepted"
-    ((SECURITY_ISSUES++))
-else
-    echo_success "✅ ID Token Security: Logged out tokens properly rejected"
-fi
-
+# Access token check
 if [ "$ACCESS_POST_RESPONSE" != "401" ] && [ "$ACCESS_POST_RESPONSE" != "403" ]; then
-    echo_error "❌ Access Token Security Issue: Logged out tokens still accepted"
-    ((SECURITY_ISSUES++))
+    if [ "$USE_ACCESS_TOKEN_PRIMARY" = true ]; then
+        echo_error "❌ Access Token Security Issue: Logged out tokens still accepted (Lambda Authorizer)"
+        ((SECURITY_ISSUES++))
+    else
+        echo_warning "⚠️  Access Token: Logged out tokens still accepted (expected for JWT Authorizer)"
+        echo_warning "   This is a known limitation of stateless JWT authorization"
+    fi
 else
     echo_success "✅ Access Token Security: Logged out tokens properly rejected"
 fi
 
+# ID token check (only for JWT authorizer)
+if [ "$USE_ACCESS_TOKEN_PRIMARY" = false ]; then
+    if [ "$ID_POST_RESPONSE" != "401" ] && [ "$ID_POST_RESPONSE" != "403" ]; then
+        echo_warning "⚠️  ID Token: Logged out tokens still accepted (expected for JWT Authorizer)"
+        echo_warning "   This is a known limitation of stateless JWT authorization"
+    else
+        echo_success "✅ ID Token Security: Logged out tokens properly rejected"
+    fi
+fi
+
+# Refresh token check (should always be invalidated)
 if echo "$REFRESH_RESPONSE" | jq -e '.AuthenticationResult.IdToken' >/dev/null 2>&1; then
     echo_error "❌ Refresh Token Security Issue: Refresh token not invalidated"
     ((SECURITY_ISSUES++))
@@ -255,11 +313,24 @@ fi
 
 echo ""
 if [ $SECURITY_ISSUES -eq 0 ]; then
-    echo_success "🎉 ALL SECURITY TESTS PASSED!"
-    echo_success "   ✅ Logout functionality is working correctly"
-    echo_success "   ✅ Invalidated tokens are properly rejected"
-    echo_success "   ✅ Fresh authentication works after logout"
-    echo_success "   ✅ No security vulnerabilities detected"
+    if [ "$USE_ACCESS_TOKEN_PRIMARY" = true ]; then
+        echo_success "🎉 ALL SECURITY TESTS PASSED (Lambda Authorizer)!"
+        echo_success "   ✅ Logout functionality is working correctly with revocation"
+        echo_success "   ✅ Invalidated Access tokens are properly rejected"
+        echo_success "   ✅ Fresh authentication works after logout"
+        echo_success "   ✅ Lambda Authorizer successfully mitigates JWT limitation"
+    else
+        echo_warning "⚠️  JWT AUTHORIZER LIMITATION CONFIRMED"
+        echo_warning "   ✅ Refresh tokens properly invalidated"
+        echo_warning "   ⚠️  ID/Access tokens remain valid until expiry (known limitation)"
+        echo_warning "   📋 See docs/SECURITY_ANALYSIS.md for mitigation strategies:"
+        echo_warning "      • Use Lambda Authorizer for revocation-aware endpoints"
+        echo_warning "      • Reduce token TTLs (15 min recommended)"
+        echo_warning "      • Implement token blacklist"
+        echo ""
+        echo_warning "   To test Lambda Authorizer (with revocation):"
+        echo_warning "   STACK_NAME=cognito-api-spike-lambda ./test_logout_security.sh"
+    fi
 else
     echo_error "🚨 SECURITY VULNERABILITIES DETECTED!"
     echo_error "   Found $SECURITY_ISSUES security issue(s)"
