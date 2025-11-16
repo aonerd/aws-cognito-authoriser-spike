@@ -1,0 +1,413 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cognito + HTTP API with Lambda Authorizer (Token Revocation Support)'
+
+Resources:
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: cognito-api-spike-lambda-pool
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+
+  # Cognito User Pool App Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: cognito-api-spike-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      # Shorter token validity for better security
+      AccessTokenValidity: 15
+      IdTokenValidity: 15
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # Custom Lambda Authorizer Execution Role
+  AuthorizerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoUserAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:GetUser
+                Resource: !GetAtt UserPool.Arn
+
+  # Custom Lambda Authorizer Function
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cognito-api-spike-lambda-authorizer
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt AuthorizerExecutionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import base64
+          import time
+
+          cognito = boto3.client('cognito-idp')
+          
+          def decode_jwt_claims(token):
+              """Decode JWT claims without verification (verification done by Cognito)"""
+              try:
+                  # JWT structure: header.payload.signature
+                  parts = token.split('.')
+                  if len(parts) != 3:
+                      raise Exception('Invalid JWT structure')
+                  
+                  # Decode payload (second part)
+                  payload = parts[1]
+                  
+                  # Add padding if needed
+                  padding = 4 - len(payload) % 4
+                  if padding != 4:
+                      payload += '=' * padding
+                  
+                  # Decode base64
+                  decoded = base64.urlsafe_b64decode(payload)
+                  claims = json.loads(decoded)
+                  
+                  return claims
+              except Exception as e:
+                  print(f'Error decoding JWT: {str(e)}')
+                  return None
+          
+          def validate_token_claims(claims):
+              """Validate basic JWT claims"""
+              try:
+                  # Check if token is expired
+                  exp = claims.get('exp', 0)
+                  if time.time() > exp:
+                      print(f'Token is expired: {exp}')
+                      return False
+                  
+                  # Verify issuer
+                  user_pool_id = os.environ['USER_POOL_ID']
+                  region = os.environ['REGION']
+                  expected_issuer = f'https://cognito-idp.{region}.amazonaws.com/{user_pool_id}'
+                  
+                  issuer = claims.get('iss', '')
+                  if issuer != expected_issuer:
+                      print(f'Invalid issuer: {issuer}')
+                      return False
+                  
+                  # Check token_use
+                  token_use = claims.get('token_use', '')
+                  if token_use not in ['access', 'id']:
+                      print(f'Invalid token_use: {token_use}')
+                      return False
+                  
+                  return True
+              except Exception as e:
+                  print(f'Error validating claims: {str(e)}')
+                  return False
+          
+          def check_token_revocation(token):
+              """Check if token is revoked by attempting to get user from Cognito"""
+              try:
+                  response = cognito.get_user(AccessToken=token)
+                  print(f'Token is valid for user: {response["Username"]}')
+                  return True
+              except cognito.exceptions.NotAuthorizedException as e:
+                  print(f'Token is revoked or invalid: {str(e)}')
+                  return False
+              except Exception as e:
+                  print(f'Error checking token revocation: {str(e)}')
+                  # If we can't verify, fail closed (deny access)
+                  return False
+          
+          def generate_policy(principal_id, effect, resource, claims=None):
+              """Generate IAM policy for API Gateway"""
+              policy = {
+                  'principalId': principal_id,
+                  'policyDocument': {
+                      'Version': '2012-10-17',
+                      'Statement': [{
+                          'Action': 'execute-api:Invoke',
+                          'Effect': effect,
+                          'Resource': resource
+                      }]
+                  }
+              }
+              
+              # Add claims to context for downstream Lambda functions
+              if claims and effect == 'Allow':
+                  # API Gateway has size limits on context, so only include essential claims
+                  policy['context'] = {
+                      'sub': str(claims.get('sub', ''))[:256],
+                      'email': str(claims.get('email', ''))[:256],
+                      'username': str(claims.get('username', claims.get('cognito:username', '')))[:256],
+                      'token_use': str(claims.get('token_use', ''))[:256],
+                      'email_verified': str(claims.get('email_verified', ''))[:256],
+                  }
+              
+              return policy
+          
+          def handler(event, context):
+              """Lambda authorizer handler"""
+              print(f'Authorizer event: {json.dumps(event)}')
+              
+              try:
+                  # Extract token from Authorization header
+                  token = event.get('headers', {}).get('authorization', '')
+                  
+                  if not token:
+                      print('No authorization header found')
+                      raise Exception('Unauthorized')
+                  
+                  # Remove 'Bearer ' prefix
+                  if token.startswith('Bearer '):
+                      token = token[7:]
+                  
+                  if not token or token == '':
+                      print('Empty token after Bearer removal')
+                      raise Exception('Unauthorized')
+                  
+                  # Step 1: Decode JWT claims (without signature verification)
+                  claims = decode_jwt_claims(token)
+                  if not claims:
+                      print('Failed to decode JWT claims')
+                      raise Exception('Unauthorized')
+                  
+                  # Step 2: Validate basic claims (expiration, issuer, etc.)
+                  if not validate_token_claims(claims):
+                      print('JWT claims validation failed')
+                      raise Exception('Unauthorized')
+                  
+                  # Step 3: Check if token is revoked (call Cognito)
+                  # This is the critical step that detects logged-out tokens
+                  if not check_token_revocation(token):
+                      print('Token is revoked or invalid in Cognito')
+                      raise Exception('Unauthorized')
+                  
+                  # Token is valid and not revoked
+                  principal_id = claims.get('sub', 'user')
+                  
+                  print(f'Authorization successful for user: {principal_id}')
+                  
+                  # Generate allow policy
+                  return generate_policy(
+                      principal_id, 
+                      'Allow', 
+                      event['routeArn'],
+                      claims
+                  )
+                  
+              except Exception as e:
+                  print(f'Authorization failed: {str(e)}')
+                  # Generate deny policy
+                  return generate_policy('user', 'Deny', event['routeArn'])
+
+  # Lambda Permission for API Gateway to invoke authorizer
+  AuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*
+
+  # Backend Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Backend Lambda Function
+  BackendFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cognito-api-spike-lambda-backend
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log('Event received:', JSON.stringify(event, null, 2));
+            const authContext = event.requestContext?.authorizer?.lambda;
+            const hasAuth = authContext && Object.keys(authContext).length > 0;
+            const claims = hasAuth ? {
+              sub: authContext.sub,
+              email: authContext.email,
+              username: authContext.username,
+              token_use: authContext.token_use,
+              email_verified: authContext.email_verified
+            } : null;
+            return {
+              statusCode: 200,
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                message: 'Success',
+                authenticated: claims !== null,
+                claims,
+                authorizerType: hasAuth ? 'Lambda' : 'None',
+                path: event.requestContext.http.path,
+                method: event.requestContext.http.method,
+                timestamp: new Date().toISOString()
+              })
+            };
+          };
+
+  # Lambda Permission for API Gateway to invoke backend
+  BackendInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackendFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/*
+
+  # HTTP API (v2)
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: cognito-api-spike-lambda-auth
+      ProtocolType: HTTP
+      Description: HTTP API with Custom Lambda Authorizer (Token Revocation Support)
+
+  # Lambda Authorizer for API Gateway
+  LambdaAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      Name: CognitoLambdaAuthorizer
+      ApiId: !Ref HttpApi
+      AuthorizerType: REQUEST
+      AuthorizerUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations
+      AuthorizerPayloadFormatVersion: '2.0'
+      EnableSimpleResponses: false
+      IdentitySource:
+        - $request.header.authorization
+
+  # Lambda Integration for backend
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt BackendFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  # Public Route (no auth)
+  PublicRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /public
+      Target: !Sub integrations/${LambdaIntegration}
+      AuthorizationType: NONE
+
+  # Secure Route (requires Lambda authorizer)
+  SecureRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /secure
+      Target: !Sub integrations/${LambdaIntegration}
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref LambdaAuthorizer
+
+  # Default Stage with auto-deploy
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        DetailedMetricsEnabled: true
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolId
+
+  UserPoolClientId:
+    Description: Cognito User Pool App Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolClientId
+
+  IssuerUrl:
+    Description: Cognito Issuer URL
+    Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+    Export:
+      Name: !Sub ${AWS::StackName}-IssuerUrl
+
+  ApiUrl:
+    Description: Base API URL
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiUrl
+
+  PublicEndpoint:
+    Description: Public endpoint (no auth required)
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/public
+
+  SecureEndpoint:
+    Description: Secure endpoint (Lambda authorizer with revocation check)
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/secure
+
+  AuthorizerFunctionArn:
+    Description: Lambda Authorizer Function ARN
+    Value: !GetAtt AuthorizerFunction.Arn
+
+  AuthorizerType:
+    Description: Type of authorizer used
+    Value: Lambda (with token revocation checking)
+

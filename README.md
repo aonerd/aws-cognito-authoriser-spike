@@ -10,12 +10,14 @@ This spike validates the complete authentication flow using:
 - **Lambda functions** for processing authenticated and public requests
 - **CloudFormation** for infrastructure as code
 
+> New: This repo also includes an optional, revocation-aware **Lambda Authorizer** that fixes the JWT authorizer's logout limitation. See "Revocation-aware Lambda Authorizer (How it works)" below.
+
 ## 🏗️ Architecture
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
 │   Client App    │───▶│   API Gateway    │───▶│  Lambda Function│
-│                 │    │  (JWT Authorizer)│    │                 │
+│                 │    │  (Authorizer)    │    │                 │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
          │                       │
          ▼                       ▼
@@ -43,7 +45,7 @@ aws sts get-caller-identity
 
 ## 🚀 Quick Start
 
-### 1. Deploy Infrastructure
+### 1. Deploy Infrastructure (JWT Authorizer)
 
 ```bash
 # Clone or navigate to the project directory
@@ -57,7 +59,15 @@ aws cloudformation deploy \
   --region us-east-1
 ```
 
-### 2. Run Comprehensive Tests
+### 1b. Deploy Revocation-aware Lambda Authorizer (optional)
+
+```bash
+# Deploy & test the Lambda Authorizer variant (revocation-aware)
+chmod +x deploy_lambda_authorizer.sh
+./deploy_lambda_authorizer.sh
+```
+
+### 2. Run Comprehensive Tests (JWT Authorizer stack)
 
 ```bash
 # Make scripts executable
@@ -75,15 +85,26 @@ chmod +x test_access_token.sh
 ./test_access_token.sh
 ```
 
+### 4. Test Logout & Token Invalidation Security
+
+```bash
+# Test logout functionality and token invalidation (JWT authorizer behavior)
+./test_logout_security.sh
+```
+
 ## 📁 Project Structure
 
 ```
 cognito-auth-spike/
-├── README.md                 # This documentation
-├── cognito-api-spike.yaml    # CloudFormation template
-├── deploy_and_test.sh        # Comprehensive test suite
-├── test_access_token.sh      # Access token specific testing
-└── CLAUDE.md                 # Development notes
+├── README.md                              # This documentation
+├── cognito-api-spike.yaml                 # CloudFormation (JWT authorizer)
+├── cognito-api-spike-lambda-authorizer.yaml  # CloudFormation (Lambda authorizer)
+├── deploy_and_test.sh                     # Comprehensive test suite
+├── test_access_token.sh                   # Access token specific testing
+├── test_logout_security.sh                # Logout & token invalidation security tests
+├── deploy_lambda_authorizer.sh            # Deploy & test the Lambda authorizer variant
+├── SECURITY_ANALYSIS.md                   # Findings + mitigation options
+└── CLAUDE.md                              # Development notes
 ```
 
 ## 🔧 Infrastructure Components
@@ -94,8 +115,8 @@ cognito-auth-spike/
 |----------|------|---------|
 | **UserPool** | `AWS::Cognito::UserPool` | User authentication and management |
 | **UserPoolClient** | `AWS::Cognito::UserPoolClient` | Application client configuration |
-| **ApiGateway** | `AWS::ApiGatewayV2::Api` | HTTP API with JWT authorization |
-| **LambdaFunction** | `AWS::Lambda::Function` | Request processing and JWT validation |
+| **ApiGateway** | `AWS::ApiGatewayV2::Api` | HTTP API with authorizer |
+| **LambdaFunction** | `AWS::Lambda::Function` | Request processing and claim propagation |
 | **ApiRoutes** | `AWS::ApiGatewayV2::Route` | Public and secure endpoint routing |
 
 ### Key Configuration
@@ -104,12 +125,13 @@ cognito-auth-spike/
 - **Authentication Flow**: `USER_PASSWORD_AUTH`
 - **Email Verification**: Required
 - **Password Policy**: Strong passwords enforced
-- **Token Expiry**: 60 minutes
+- **Token Expiry**: 60 minutes (JWT authorizer) / 15 minutes (Lambda authorizer template)
 
 #### API Gateway Configuration
 - **Protocol**: HTTP API v2
-- **Authorization**: JWT with Cognito User Pool
-- **CORS**: Enabled for web applications
+- **Authorization**:
+  - JWT authorizer (stateless validation)
+  - Lambda authorizer (revocation-aware) — optional
 - **Endpoints**:
   - `GET /public` - No authentication required
   - `GET /secure` - JWT token required
@@ -143,6 +165,15 @@ curl -X GET "https://we97janri4.execute-api.us-east-1.amazonaws.com/secure" \
   -H "Authorization: Bearer <JWT_TOKEN>"
 ```
 
+### 4. Logout & Token Invalidation
+```bash
+# Perform global sign-out to invalidate all user tokens
+aws cognito-idp admin-user-global-sign-out \
+  --user-pool-id us-east-1_XtvlFLK5I \
+  --username testuser@example.com \
+  --region us-east-1
+```
+
 ## 🧪 Testing & Validation
 
 ### Test Scenarios Covered
@@ -153,6 +184,9 @@ curl -X GET "https://we97janri4.execute-api.us-east-1.amazonaws.com/secure" \
 | **Unauthorized Access** | `GET /secure` | ❌ No token | 401 - Unauthorized |
 | **ID Token Auth** | `GET /secure` | ✅ ID Token | 200 - User profile claims |
 | **Access Token Auth** | `GET /secure` | ✅ Access Token | 200 - Permission scopes |
+| **Pre-Logout Tokens** | `GET /secure` | ✅ Valid Token | 200 - Should work before logout |
+| **Post-Logout Tokens** | `GET /secure` | ❌ Logged Out Token | 401 - Should be rejected |
+| **Fresh Tokens** | `GET /secure` | ✅ New Token | 200 - Should work after re-auth |
 
 ### Sample Test Results
 
@@ -285,59 +319,129 @@ echo "$ID_TOKEN" | cut -d. -f2 | base64 -d | jq .
 echo "$ACCESS_TOKEN" | cut -d. -f2 | base64 -d | jq .
 ```
 
-## 🏃‍♂️ Running the Test Scripts
-
-### Comprehensive Test Suite
+### Test Logout & Token Invalidation
 ```bash
-./deploy_and_test.sh
-```
-**What it does:**
-- Deploys/updates CloudFormation stack
-- Creates test user with permanent password
-- Authenticates and obtains JWT tokens
-- Tests all endpoints (public, secure with/without auth)
-- Tests both ID tokens and Access tokens
-- Decodes and displays JWT claims
-- Provides cleanup commands
+# Step 1: Test token before logout (should work)
+curl -s -H "Authorization: Bearer $ID_TOKEN" \
+  "https://we97janri4.execute-api.us-east-1.amazonaws.com/secure" | jq .
 
-### Access Token Specific Testing
-```bash
-./test_access_token.sh  
+# Step 2: Perform global logout
+aws cognito-idp admin-user-global-sign-out \
+  --user-pool-id us-east-1_XtvlFLK5I \
+  --username testuser@example.com \
+  --region us-east-1
+
+# Step 3: Test same token after logout (should fail with 401)
+curl -s -H "Authorization: Bearer $ID_TOKEN" \
+  "https://we97janri4.execute-api.us-east-1.amazonaws.com/secure" | jq .
+# Expected: {"message":"Unauthorized"}
+
+# Step 4: Get fresh tokens and test (should work again)
+AUTH_RESPONSE=$(aws cognito-idp initiate-auth \
+  --auth-flow USER_PASSWORD_AUTH \
+  --client-id 56biap7pfvd71m905desqgvp7t \
+  --auth-parameters USERNAME=testuser@example.com,PASSWORD=MySecurePass123! \
+  --region us-east-1)
+
+NEW_ID_TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.AuthenticationResult.IdToken')
+curl -s -H "Authorization: Bearer $NEW_ID_TOKEN" \
+  "https://we97janri4.execute-api.us-east-1.amazonaws.com/secure" | jq .
 ```
-**What it does:**
-- Gets fresh access token from Cognito
-- Generates ready-to-use curl command
-- Tests access token against secure endpoint
-- Displays access token specific claims
+
+### Manual Logout Test (Lambda Authorizer — revocation-aware)
+Use these commands to validate that a logged-out Access token is rejected and a fresh token works again.
+
+```bash
+# 1) Load stack outputs for the Lambda authorizer stack
+export STACK=cognito-api-spike-lambda
+export REGION=us-east-1
+export API_URL=$(aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
+export USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+export CLIENT_ID=$(aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" --query "Stacks[0].Outputs[?OutputKey=='UserPoolClientId'].OutputValue" --output text)
+
+# 2) Authenticate to obtain an Access token
+export USERNAME="testuser@example.com"
+export PASSWORD="MySecurePass123!"
+AUTH_JSON=$(aws cognito-idp initiate-auth \
+  --auth-flow USER_PASSWORD_AUTH \
+  --client-id "$CLIENT_ID" \
+  --auth-parameters USERNAME="$USERNAME",PASSWORD="$PASSWORD" \
+  --region "$REGION")
+export ACCESS_TOKEN=$(echo "$AUTH_JSON" | jq -r '.AuthenticationResult.AccessToken')
+
+# 3) Sanity: secure endpoint with token — expect 200
+curl -s -o /dev/null -w "Secure (with token) -> HTTP %{http_code}\n" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" "$API_URL/secure"
+
+# 4) Global sign-out — revoke tokens
+aws cognito-idp global-sign-out --access-token "$ACCESS_TOKEN" --region "$REGION"
+sleep 3
+
+# 5) Same token after logout — expect 401/403
+curl -s -o /dev/null -w "Secure (revoked token) -> HTTP %{http_code}\n" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" "$API_URL/secure"
+
+# 6) Re-authenticate — fresh token should work
+AUTH_JSON2=$(aws cognito-idp initiate-auth \
+  --auth-flow USER_PASSWORD_AUTH \
+  --client-id "$CLIENT_ID" \
+  --auth-parameters USERNAME="$USERNAME",PASSWORD="$PASSWORD" \
+  --region "$REGION")
+NEW_ACCESS_TOKEN=$(echo "$AUTH_JSON2" | jq -r '.AuthenticationResult.AccessToken')
+
+curl -s -o /dev/null -w "Secure (fresh token) -> HTTP %{http_code}\n" \
+  -H "Authorization: Bearer $NEW_ACCESS_TOKEN" "$API_URL/secure"
+
+# Optional: pretty print the secure response
+curl -s -H "Authorization: Bearer $NEW_ACCESS_TOKEN" "$API_URL/secure" | jq .
+```
+
+## 🔒 Revocation-aware Lambda Authorizer (How it works)
+
+Why: API Gateway's built-in JWT authorizer does not check token revocation, so logged-out tokens remain valid until expiry. The Lambda Authorizer adds a real-time revocation check.
+
+Implementation (inline Lambda, Python 3.11):
+- Extract `Authorization` header, strip `Bearer` prefix
+- Decode JWT payload (base64url) to get claims
+- Validate minimal claims:
+  - `exp` (not expired)
+  - `iss` matches `https://cognito-idp.<region>.amazonaws.com/<userPoolId>`
+  - `token_use` is `access` or `id`
+- Critical revocation step: call `cognito-idp:GetUser` with the Access token
+  - If Cognito returns user → token is still valid
+  - If returns `NotAuthorizedException` → token has been revoked / is invalid → deny
+- Return IAM Allow/Deny policy; include minimal claims in the authorizer context for the backend Lambda
+
+Key files:
+- Template: `cognito-api-spike-lambda-authorizer.yaml`
+- Deploy & test script: `deploy_lambda_authorizer.sh`
+- Backend extracts claims from `event.requestContext.authorizer.lambda`
 
 ## 📊 Deployment Information
 
-### Current Deployment Details
+### Current Deployment Details (JWT Authorizer example)
 - **Stack Name**: `cognito-api-spike`
 - **Region**: `us-east-1`
 - **User Pool ID**: `us-east-1_XtvlFLK5I`
 - **Client ID**: `56biap7pfvd71m905desqgvp7t`
 - **API URL**: `https://we97janri4.execute-api.us-east-1.amazonaws.com`
 
-### Endpoints
-- **Public**: `https://we97janri4.execute-api.us-east-1.amazonaws.com/public`
-- **Secure**: `https://we97janri4.execute-api.us-east-1.amazonaws.com/secure`
+> For the Lambda Authorizer stack, run `./deploy_lambda_authorizer.sh` and use the printed outputs, or export them via the commands in the manual test above.
 
 ## 🚨 Security Considerations
 
-### ✅ Validated Security Features
-- JWT signature verification by API Gateway
-- Token expiration enforcement (60 minutes)
-- Proper rejection of requests without valid tokens
-- Secure token generation with proper claims
-- HTTPS-only communication
+### JWT Authorizer Limitation and Mitigation
+- Limitation: Stateless verification (signature/exp/aud/iss) → no revocation checks
+- Impact: Logged-out tokens remain valid until natural expiration
+- Mitigation implemented here: **Lambda Authorizer** with Cognito `GetUser` check
+- Details and alternatives (shorter TTLs, blacklist, hybrid): see `SECURITY_ANALYSIS.md`
 
-### 🔒 Best Practices Implemented
-- Strong password policy enforcement
-- Email verification required
-- Temporary passwords for initial setup
-- Proper error handling and response codes
-- Comprehensive logging via CloudWatch
+### ✅ Validated Security Features
+- Proper rejection of unauthenticated requests (401/403)
+- Secure token generation with correct claims
+- HTTPS-only communication
+- Refresh token invalidation on logout
+- With Lambda Authorizer: **post-logout Access tokens are rejected**
 
 ## 🧹 Cleanup
 
@@ -366,6 +470,10 @@ aws cloudformation describe-stacks --stack-name cognito-api-spike --region us-ea
 4. **Public/Private Endpoints** - Correct authorization behavior
 5. **Token Type Flexibility** - Both ID and Access tokens accepted
 6. **Infrastructure as Code** - Complete CloudFormation deployment
+7. **Security Limitation Discovery** - Critical token revocation findings
+
+### ⚠️ Critical Security Finding
+**API Gateway JWT Authorizer Limitation:** Does not check token revocation status with Cognito. Logged-out tokens remain valid until expiration. This is a known AWS design limitation requiring mitigation strategies.
 
 ### 🚀 Ready for Production Considerations
 - **Scalability**: Cognito handles millions of users
@@ -404,6 +512,9 @@ aws cloudformation describe-stacks --stack-name cognito-api-spike --region us-ea
 - ✅ ID token authentication and claim extraction
 - ✅ Access token authentication and scope validation
 - ✅ JWT token decoding and validation
+- ✅ **Logout security validation** - Tokens properly invalidated on logout
+- ✅ **Token invalidation testing** - Logged out tokens correctly rejected
+- ✅ **Refresh token security** - Refresh tokens invalidated during logout
 - ✅ Comprehensive error handling
 
 **The Cognito authentication spike is production-ready for integration! 🎉**

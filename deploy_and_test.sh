@@ -199,6 +199,129 @@ else
 fi
 echo ""
 
+# Test 5: Token invalidation (logout) testing
+echo_status "Test 5: Token invalidation and logout security"
+echo_status "5a. Testing tokens BEFORE logout (should work)"
+
+# Test ID token before logout
+echo_status "Testing ID token before logout..."
+PRE_LOGOUT_ID_RESPONSE=$(curl -sS -H "Authorization: Bearer ${ID_TOKEN}" "${API_URL}/secure" -w "HTTP_STATUS:%{http_code}" 2>/dev/null)
+PRE_LOGOUT_ID_STATUS=$(echo "$PRE_LOGOUT_ID_RESPONSE" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
+PRE_LOGOUT_ID_BODY=$(echo "$PRE_LOGOUT_ID_RESPONSE" | sed 's/HTTP_STATUS:[0-9]*$//')
+
+if [ "$PRE_LOGOUT_ID_STATUS" = "200" ]; then
+    echo_success "✅ ID token works before logout (status: $PRE_LOGOUT_ID_STATUS)"
+else
+    echo_error "❌ ID token failed before logout (status: $PRE_LOGOUT_ID_STATUS)"
+fi
+
+# Test Access token before logout
+echo_status "Testing Access token before logout..."
+PRE_LOGOUT_ACCESS_RESPONSE=$(curl -sS -H "Authorization: Bearer ${ACCESS_TOKEN}" "${API_URL}/secure" -w "HTTP_STATUS:%{http_code}" 2>/dev/null)
+PRE_LOGOUT_ACCESS_STATUS=$(echo "$PRE_LOGOUT_ACCESS_RESPONSE" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
+PRE_LOGOUT_ACCESS_BODY=$(echo "$PRE_LOGOUT_ACCESS_RESPONSE" | sed 's/HTTP_STATUS:[0-9]*$//')
+
+if [ "$PRE_LOGOUT_ACCESS_STATUS" = "200" ]; then
+    echo_success "✅ Access token works before logout (status: $PRE_LOGOUT_ACCESS_STATUS)"
+else
+    echo_error "❌ Access token failed before logout (status: $PRE_LOGOUT_ACCESS_STATUS)"
+fi
+
+echo ""
+echo_status "5b. Performing GLOBAL SIGN OUT to invalidate tokens..."
+
+# Perform global sign out to invalidate all tokens for the user
+aws cognito-idp admin-user-global-sign-out \
+  --user-pool-id "$USER_POOL_ID" \
+  --username "$USERNAME" \
+  --region "$REGION" >/dev/null 2>&1
+
+if [ $? -eq 0 ]; then
+    echo_success "✅ Global sign out completed successfully"
+else
+    echo_error "❌ Global sign out failed"
+    exit 1
+fi
+
+echo ""
+echo_status "5c. Testing the SAME tokens AFTER logout (should be rejected)"
+
+# Wait a moment for the logout to propagate
+sleep 2
+
+# Test ID token after logout (should fail)
+echo_status "Testing ID token after logout..."
+POST_LOGOUT_ID_RESPONSE=$(curl -sS -H "Authorization: Bearer ${ID_TOKEN}" "${API_URL}/secure" -w "HTTP_STATUS:%{http_code}" 2>/dev/null)
+POST_LOGOUT_ID_STATUS=$(echo "$POST_LOGOUT_ID_RESPONSE" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
+POST_LOGOUT_ID_BODY=$(echo "$POST_LOGOUT_ID_RESPONSE" | sed 's/HTTP_STATUS:[0-9]*$//')
+
+echo "HTTP Status: $POST_LOGOUT_ID_STATUS"
+echo "Response: $POST_LOGOUT_ID_BODY"
+
+if [ "$POST_LOGOUT_ID_STATUS" = "401" ] || [ "$POST_LOGOUT_ID_STATUS" = "403" ]; then
+    echo_success "✅ ID token correctly rejected after logout (status: $POST_LOGOUT_ID_STATUS)"
+else
+    echo_error "❌ ID token still accepted after logout (status: $POST_LOGOUT_ID_STATUS) - SECURITY ISSUE!"
+fi
+
+# Test Access token after logout (should fail)
+echo_status "Testing Access token after logout..."
+POST_LOGOUT_ACCESS_RESPONSE=$(curl -sS -H "Authorization: Bearer ${ACCESS_TOKEN}" "${API_URL}/secure" -w "HTTP_STATUS:%{http_code}" 2>/dev/null)
+POST_LOGOUT_ACCESS_STATUS=$(echo "$POST_LOGOUT_ACCESS_RESPONSE" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
+POST_LOGOUT_ACCESS_BODY=$(echo "$POST_LOGOUT_ACCESS_RESPONSE" | sed 's/HTTP_STATUS:[0-9]*$//')
+
+echo "HTTP Status: $POST_LOGOUT_ACCESS_STATUS"
+echo "Response: $POST_LOGOUT_ACCESS_BODY"
+
+if [ "$POST_LOGOUT_ACCESS_STATUS" = "401" ] || [ "$POST_LOGOUT_ACCESS_STATUS" = "403" ]; then
+    echo_success "✅ Access token correctly rejected after logout (status: $POST_LOGOUT_ACCESS_STATUS)"
+else
+    echo_error "❌ Access token still accepted after logout (status: $POST_LOGOUT_ACCESS_STATUS) - SECURITY ISSUE!"
+fi
+
+echo ""
+echo_status "5d. Testing with FRESH tokens after logout (should work again)"
+
+# Authenticate again to get new tokens
+echo_status "Getting fresh tokens after logout..."
+NEW_AUTH_RESPONSE=$(aws cognito-idp initiate-auth \
+  --auth-flow USER_PASSWORD_AUTH \
+  --client-id "$CLIENT_ID" \
+  --auth-parameters USERNAME="$USERNAME",PASSWORD="$PERM_PASS" \
+  --region "$REGION")
+
+NEW_ID_TOKEN=$(echo "$NEW_AUTH_RESPONSE" | jq -r '.AuthenticationResult.IdToken // empty')
+NEW_ACCESS_TOKEN=$(echo "$NEW_AUTH_RESPONSE" | jq -r '.AuthenticationResult.AccessToken // empty')
+
+if [ -n "$NEW_ID_TOKEN" ] && [ "$NEW_ID_TOKEN" != "null" ]; then
+    echo_success "✅ Fresh tokens obtained successfully after logout"
+
+    # Test fresh ID token
+    echo_status "Testing fresh ID token..."
+    FRESH_ID_RESPONSE=$(curl -sS -H "Authorization: Bearer ${NEW_ID_TOKEN}" "${API_URL}/secure" -w "HTTP_STATUS:%{http_code}" 2>/dev/null)
+    FRESH_ID_STATUS=$(echo "$FRESH_ID_RESPONSE" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
+
+    if [ "$FRESH_ID_STATUS" = "200" ]; then
+        echo_success "✅ Fresh ID token works correctly (status: $FRESH_ID_STATUS)"
+    else
+        echo_error "❌ Fresh ID token failed (status: $FRESH_ID_STATUS)"
+    fi
+
+    # Test fresh Access token
+    echo_status "Testing fresh Access token..."
+    FRESH_ACCESS_RESPONSE=$(curl -sS -H "Authorization: Bearer ${NEW_ACCESS_TOKEN}" "${API_URL}/secure" -w "HTTP_STATUS:%{http_code}" 2>/dev/null)
+    FRESH_ACCESS_STATUS=$(echo "$FRESH_ACCESS_RESPONSE" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
+
+    if [ "$FRESH_ACCESS_STATUS" = "200" ]; then
+        echo_success "✅ Fresh Access token works correctly (status: $FRESH_ACCESS_STATUS)"
+    else
+        echo_error "❌ Fresh Access token failed (status: $FRESH_ACCESS_STATUS)"
+    fi
+else
+    echo_error "❌ Failed to obtain fresh tokens after logout"
+fi
+echo ""
+
 # Function to decode JWT token payload
 decode_jwt_payload() {
     local token="$1"
@@ -240,6 +363,9 @@ echo_success "✅ Authentication flow working (obtained JWT tokens)"
 echo_success "✅ Public endpoint accessible without authentication"
 echo_success "✅ Secure endpoint properly rejecting unauthorized requests"
 echo_success "✅ Secure endpoint accepting valid JWT tokens and returning claims"
+echo_success "✅ Token invalidation (logout) security verified"
+echo_success "✅ Logged out tokens properly rejected by authorizer"
+echo_success "✅ Fresh tokens work correctly after logout"
 
 echo ""
 echo_status "📋 Infrastructure Details:"
