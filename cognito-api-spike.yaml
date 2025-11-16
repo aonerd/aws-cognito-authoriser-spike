@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'End-to-end Cognito + HTTP API (v2) JWT Authorizer spike environment'
+
+Resources:
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: cognito-api-spike-pool
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+
+  # Cognito User Pool App Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: cognito-api-spike-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Lambda Function
+  BackendFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cognito-api-spike-backend
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log('Event received:', JSON.stringify(event, null, 2));
+
+            const claims = event.requestContext?.authorizer?.jwt?.claims || null;
+
+            return {
+              statusCode: 200,
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({
+                message: 'Success',
+                authenticated: claims !== null,
+                claims: claims,
+                path: event.requestContext.http.path,
+                method: event.requestContext.http.method,
+                timestamp: new Date().toISOString()
+              })
+            };
+          };
+
+  # Lambda Permission for API Gateway
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackendFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/*
+
+  # HTTP API (v2)
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: cognito-api-spike
+      ProtocolType: HTTP
+      Description: HTTP API with Cognito JWT Authorizer spike
+
+  # JWT Authorizer
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: CognitoJwtAuthorizer
+      IdentitySource:
+        - $request.header.Authorization
+      JwtConfiguration:
+        Audience:
+          - !Ref UserPoolClient
+        Issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+
+  # Lambda Integration
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt BackendFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  # Public Route (no auth)
+  PublicRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /public
+      Target: !Sub integrations/${LambdaIntegration}
+      AuthorizationType: NONE
+
+  # Secure Route (requires JWT)
+  SecureRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /secure
+      Target: !Sub integrations/${LambdaIntegration}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  # Default Stage with auto-deploy
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolId
+
+  UserPoolClientId:
+    Description: Cognito User Pool App Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolClientId
+
+  IssuerUrl:
+    Description: Cognito Issuer URL
+    Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+    Export:
+      Name: !Sub ${AWS::StackName}-IssuerUrl
+
+  ApiUrl:
+    Description: Base API URL
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiUrl
+
+  PublicEndpoint:
+    Description: Public endpoint (no auth required)
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/public
+
+  SecureEndpoint:
+    Description: Secure endpoint (JWT required)
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/secure
+
+
+# ============================================================================
+# CLI DEPLOYMENT AND TESTING INSTRUCTIONS
+# ============================================================================
+#
+# STEP 1: Deploy the CloudFormation stack
+# ----------------------------------------
+# aws cloudformation deploy \
+#   --template-file cognito-api-spike.yaml \
+#   --stack-name cognito-api-spike \
+#   --capabilities CAPABILITY_IAM \
+#   --region us-east-1
+#
+#
+# STEP 2: Get the stack outputs
+# ------------------------------
+# aws cloudformation describe-stacks \
+#   --stack-name cognito-api-spike \
+#   --region us-east-1 \
+#   --query 'Stacks[0].Outputs'
+#
+# Or individually:
+# USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name cognito-api-spike --region us-east-1 --query 'Stacks[0].Outputs[?OutputKey==`UserPoolId`].OutputValue' --output text)
+# CLIENT_ID=$(aws cloudformation describe-stacks --stack-name cognito-api-spike --region us-east-1 --query 'Stacks[0].Outputs[?OutputKey==`UserPoolClientId`].OutputValue' --output text)
+# API_URL=$(aws cloudformation describe-stacks --stack-name cognito-api-spike --region us-east-1 --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' --output text)
+#
+#
+# STEP 3: Create a test user
+# ---------------------------
+# aws cognito-idp admin-create-user \
+#   --user-pool-id $USER_POOL_ID \
+#   --username testuser@example.com \
+#   --user-attributes Name=email,Value=testuser@example.com Name=email_verified,Value=true \
+#   --temporary-password TempPass123! \
+#   --message-action SUPPRESS \
+#   --region us-east-1
+#
+#
+# STEP 4: Set permanent password (required after admin-create-user)
+# ------------------------------------------------------------------
+# aws cognito-idp admin-set-user-password \
+#   --user-pool-id $USER_POOL_ID \
+#   --username testuser@example.com \
+#   --password MySecurePass123! \
+#   --permanent \
+#   --region us-east-1
+#
+#
+# STEP 5: Authenticate and get tokens
+# ------------------------------------
+# AUTH_RESPONSE=$(aws cognito-idp initiate-auth \
+#   --auth-flow USER_PASSWORD_AUTH \
+#   --client-id $CLIENT_ID \
+#   --auth-parameters USERNAME=testuser@example.com,PASSWORD=MySecurePass123! \
+#   --region us-east-1)
+#
+# Extract tokens:
+# ID_TOKEN=$(echo $AUTH_RESPONSE | jq -r '.AuthenticationResult.IdToken')
+# ACCESS_TOKEN=$(echo $AUTH_RESPONSE | jq -r '.AuthenticationResult.AccessToken')
+#
+# Verify tokens were retrieved:
+# echo "ID Token: ${ID_TOKEN:0:50}..."
+# echo "Access Token: ${ACCESS_TOKEN:0:50}..."
+#
+#
+# STEP 6: Test the public endpoint (no auth)
+# -------------------------------------------
+# curl -X GET "${API_URL}/public"
+#
+#
+# STEP 7: Test the secure endpoint (without token - should fail)
+# ---------------------------------------------------------------
+# curl -X GET "${API_URL}/secure"
+# Expected: {"message":"Unauthorized"}
+#
+#
+# STEP 8: Test the secure endpoint (with ID token - should succeed)
+# ------------------------------------------------------------------
+# curl -X GET "${API_URL}/secure" \
+#   -H "Authorization: Bearer ${ID_TOKEN}"
+#
+# Expected: JSON response with authenticated: true and claims data
+#
+#
+# STEP 9: Decode the JWT to inspect claims (optional)
+# ----------------------------------------------------
+# echo $ID_TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | jq .
+#
+#
+# STEP 10: Clean up - Delete the stack
+# -------------------------------------
+# aws cloudformation delete-stack \
+#   --stack-name cognito-api-spike \
+#   --region us-east-1
+#
+# Monitor deletion:
+# aws cloudformation wait stack-delete-complete \
+#   --stack-name cognito-api-spike \
+#   --region us-east-1
+#
+# ============================================================================
