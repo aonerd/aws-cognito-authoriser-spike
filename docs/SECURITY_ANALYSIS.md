@@ -188,7 +188,7 @@ This spike demonstrates a practical, deployable mitigation for logout security w
 - [JWT Best Practices RFC](https://tools.ietf.org/html/rfc8725)
 - [OWASP Token Revocation Guidelines](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html#token-sidejacking)
 - Project files:  
-  - `cognito-api-spike-lambda-authorizer.yaml` (Lambda Authorizer stack)  
-  - `deploy_lambda_authorizer.sh` (deployment + automated revocation test)  
+  - `../cognito-api-spike-lambda-authorizer.yaml` (Lambda Authorizer stack)  
+  - `../deploy_lambda_authorizer.sh` (deployment + automated revocation test)  
   - `DESIGN.md` (deep dive)  
-  - `README.md` (manual curl tests)
+  - `../README.md` (manual curl tests)

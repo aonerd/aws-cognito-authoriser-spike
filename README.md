@@ -14,18 +14,65 @@ This spike validates the complete authentication flow using:
 
 ## 🏗️ Architecture
 
+Below are two supported variants. Only the Lambda Authorizer variant calls Cognito at request time; the backend Lambda never calls Cognito in this spike.
+
+### Variant A — JWT Authorizer (stateless)
+- Fast and cheap. Accepts ID or Access tokens.
+- No revocation checking (logged-out tokens stay valid until exp).
+
 ```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Client App    │───▶│   API Gateway    │───▶│  Lambda Function│
-│                 │    │  (Authorizer)    │    │                 │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-         │                       │
-         ▼                       ▼
-┌─────────────────┐    ┌──────────────────┐
-│ Cognito User    │    │ CloudWatch Logs  │
-│ Pool            │    │                  │
-└─────────────────┘    └──────────────────┘
+┌───────────────┐        ┌───────────────────────────┐        ┌─────────────────────┐
+│   Client      │ ─────▶ │ API Gateway (HTTP API v2) │ ─────▶ │ Backend Lambda      │
+└───────────────┘        │  JWT Authorizer (JWKs)    │        │ (business logic)    │
+                          └───────────────────────────┘        └─────────────────────┘
+                                   ▲
+                                   │ (no runtime call to Cognito; JWT verified statelessly)
+                                   │
+                            ┌───────────────┐
+                            │  Cognito      │  (used for sign-in/token issuance only)
+                            └───────────────┘
+
+CloudWatch Logs: API Gateway and Backend Lambda logs
 ```
+
+### Variant B — Lambda Authorizer (revocation‑aware)
+- Accepts Access tokens only (required by Cognito GetUser).
+- Denies logged‑out tokens immediately by consulting Cognito.
+
+```
+┌───────────────┐        ┌───────────────────────────┐        ┌─────────────────────┐
+│   Client      │ ─────▶ │ API Gateway (HTTP API v2) │ ──┬──▶ │ Backend Lambda      │
+└───────────────┘        │  Authorizer: Lambda       │  │    │ (business logic)    │
+                          └───────────────────────────┘  │    └─────────────────────┘
+                                                          │ Allow only
+                                                          │ when token is active
+                                                          ▼
+                                                  ┌──────────────────┐
+                                                  │ Lambda Authorizer│
+                                                  │  • decode exp/iss│
+                                                  │  • token_use=access
+                                                  │  • Cognito GetUser
+                                                  └─────────┬────────┘
+                                                            │
+                                                            ▼
+                                                      ┌───────────────┐
+                                                      │   Cognito     │ (GetUser with Access token)
+                                                      └───────────────┘
+
+CloudWatch Logs: Authorizer Lambda and Backend Lambda logs
+```
+
+Notes
+- Backend Lambda does not call Cognito; only the Lambda Authorizer does in Variant B.
+- Public route (/public) bypasses any authorizer in both variants.
+
+Which stack am I on?
+- JWT Authorizer (stateless): stack `cognito-api-spike` (template `cognito-api-spike.yaml`)
+- Lambda Authorizer (revocation-aware): stack `cognito-api-spike-lambda` (template `cognito-api-spike-lambda-authorizer.yaml`)
+
+### When to choose which?
+- Use JWT Authorizer for low/medium‑sensitivity routes where immediate logout is not required.
+- Use Lambda Authorizer for high‑value routes where “logout must take effect immediately.”
 
 ## 📋 Prerequisites
 
@@ -103,7 +150,10 @@ cognito-auth-spike/
 ├── test_access_token.sh                   # Access token specific testing
 ├── test_logout_security.sh                # Logout & token invalidation security tests
 ├── deploy_lambda_authorizer.sh            # Deploy & test the Lambda authorizer variant
-├── SECURITY_ANALYSIS.md                   # Findings + mitigation options
+├── docs/
+│   ├── DESIGN.md                          # Deep-dive design (moved here)
+│   ├── SECURITY_ANALYSIS.md               # Security findings & mitigations (moved here)
+│   └── chatgpt-design-review.md           # Design review notes (moved here)
 └── CLAUDE.md                              # Development notes
 ```
 
@@ -415,6 +465,8 @@ Implementation (inline Lambda, Python 3.11):
 Key files:
 - Template: `cognito-api-spike-lambda-authorizer.yaml`
 - Deploy & test script: `deploy_lambda_authorizer.sh`
+- Design: `docs/DESIGN.md`
+- Security analysis: `docs/SECURITY_ANALYSIS.md`
 - Backend extracts claims from `event.requestContext.authorizer.lambda`
 
 ## 📊 Deployment Information
@@ -434,7 +486,7 @@ Key files:
 - Limitation: Stateless verification (signature/exp/aud/iss) → no revocation checks
 - Impact: Logged-out tokens remain valid until natural expiration
 - Mitigation implemented here: **Lambda Authorizer** with Cognito `GetUser` check
-- Details and alternatives (shorter TTLs, blacklist, hybrid): see `SECURITY_ANALYSIS.md`
+- Details and alternatives (shorter TTLs, blacklist, hybrid): see `docs/SECURITY_ANALYSIS.md`
 
 ### ✅ Validated Security Features
 - Proper rejection of unauthenticated requests (401/403)
@@ -494,8 +546,11 @@ aws cloudformation describe-stacks --stack-name cognito-api-spike --region us-ea
 
 ## 🔗 Additional Resources
 
+- `docs/DESIGN.md` — Deep design for both authorizer variants and flows
+- `docs/SECURITY_ANALYSIS.md` — Revocation limitation, mitigation strategies, and test evidence
+- `docs/chatgpt-design-review.md` — Review notes and recommendations
 - [AWS Cognito User Pools Documentation](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-identity-pools.html)
-- [API Gateway HTTP API Documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api.html)  
+- [API Gateway HTTP API Documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api.html)
 - [JWT Token Standard (RFC 7519)](https://tools.ietf.org/html/rfc7519)
 - [AWS CloudFormation Documentation](https://docs.aws.amazon.com/cloudformation/)
 
